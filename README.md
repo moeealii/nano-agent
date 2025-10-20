@@ -15,8 +15,8 @@ Agent frameworks hide the parts that matter. This is the opposite: one file you 
 
 | Section | What it does |
 |---|---|
-| **Workspace** | Resolves every model-supplied path and refuses anything outside the project root. |
-| **Tools** | `read_file`, `write_file`, `edit_file` (exact string replacement), `bash`, `grep`, `glob`. Each is a plain function plus a JSON schema. |
+| **Workspace** | Resolves every model-supplied path and refuses anything outside the project root. Records the mtime of every file the model reads, so an edit to a file that changed since is rejected rather than silently clobbering it. |
+| **Tools** | `read_file`, `write_file`, `edit_file` (exact, unique string replacement), `bash`, `grep`, `glob`. Each is a plain function plus a JSON schema. |
 | **Permissions** | Read-only tools run freely. Writes and commands ask `[y]es / [n]o / [a]lways`. A short list of catastrophic commands (`rm -rf /`, `mkfs`, force-push, ...) is refused even with `--yolo`. |
 | **The loop** | Stream a reply, run the tools it asked for, append every result, repeat. About 40 lines. |
 

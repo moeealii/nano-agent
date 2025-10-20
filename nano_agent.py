@@ -59,6 +59,8 @@ class ToolError(Exception):
 class Workspace:
     def __init__(self, root: Path):
         self.root = root.resolve()
+        # mtime of every file the model has read, so edits to stale files fail.
+        self.seen: dict[Path, int] = {}
 
     def path(self, p: str) -> Path:
         target = (self.root / p).resolve()
@@ -68,6 +70,15 @@ class Workspace:
 
     def rel(self, p: Path) -> str:
         return p.relative_to(self.root).as_posix() or "."
+
+    def mark_seen(self, p: Path) -> None:
+        self.seen[p] = p.stat().st_mtime_ns
+
+    def check_fresh(self, p: Path) -> None:
+        if p not in self.seen:
+            raise ToolError(f"read {self.rel(p)} before editing it")
+        if p.stat().st_mtime_ns != self.seen[p]:
+            raise ToolError(f"{self.rel(p)} changed since you last read it; read it again")
 
     def walk(self, start: Path):
         for dirpath, dirnames, filenames in os.walk(start):
@@ -85,6 +96,7 @@ def read_file(ws: Workspace, path: str, offset: int = 1, limit: int = 2000) -> s
     if not p.is_file():
         raise ToolError(f"no such file: {path}")
     lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    ws.mark_seen(p)
     start = max(offset, 1) - 1
     chunk = lines[start : start + limit]
     body = "\n".join(f"{i:>6}\t{line}" for i, line in enumerate(chunk, start + 1))
@@ -94,8 +106,11 @@ def read_file(ws: Workspace, path: str, offset: int = 1, limit: int = 2000) -> s
 
 def write_file(ws: Workspace, path: str, content: str) -> str:
     p = ws.path(path)
+    if p.exists():
+        ws.check_fresh(p)  # overwriting is an edit: you must have seen what you replace
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
+    ws.mark_seen(p)
     return f"wrote {ws.rel(p)} ({len(content.splitlines())} lines)"
 
 
@@ -103,11 +118,16 @@ def edit_file(ws: Workspace, path: str, old: str, new: str, replace_all: bool = 
     p = ws.path(path)
     if not p.is_file():
         raise ToolError(f"no such file: {path}")
+    ws.check_fresh(p)
     text = p.read_text(encoding="utf-8")
-    if old not in text:
+    count = text.count(old)
+    if count == 0:
         raise ToolError("old text not found; copy it exactly from read_file output, without the line numbers")
-    p.write_text(text.replace(old, new, 1), encoding="utf-8")
-    return f"edited {ws.rel(p)}"
+    if count > 1 and not replace_all:
+        raise ToolError(f"old text occurs {count} times; add surrounding lines to make it unique, or set replace_all")
+    p.write_text(text.replace(old, new) if replace_all else text.replace(old, new, 1), encoding="utf-8")
+    ws.mark_seen(p)
+    return f"edited {ws.rel(p)}" + (f" ({count} replacements)" if replace_all and count > 1 else "")
 
 
 def bash(ws: Workspace, command: str, timeout: int = 120) -> str:
@@ -388,8 +408,6 @@ class Agent:
     @staticmethod
     def error(tool_use_id: str, message: str) -> dict:
         return {"type": "tool_result", "tool_use_id": tool_use_id, "content": message, "is_error": True}
-
-    # -- subagents ---------------------------------------------------------
 
 def build_system(cfg: Config) -> str:
     shell = "cmd.exe" if platform.system() == "Windows" else "sh"

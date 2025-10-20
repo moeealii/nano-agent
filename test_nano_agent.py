@@ -135,6 +135,27 @@ def test_catastrophic_commands_are_refused_even_in_yolo(project):
 
 # -- workspace safety ------------------------------------------------------
 
+
+def test_edits_require_a_fresh_read(project):
+    ws = na.Workspace(project)
+    with pytest.raises(na.ToolError, match="read app.py before editing"):
+        na.edit_file(ws, "app.py", "a - b", "a + b")
+    na.read_file(ws, "app.py")
+    (project / "app.py").write_text("changed underneath\n")
+    import os
+    os.utime(project / "app.py", ns=(1, 1))
+    with pytest.raises(na.ToolError, match="changed since you last read"):
+        na.edit_file(ws, "app.py", "changed", "x")
+
+
+def test_ambiguous_edit_is_rejected(project):
+    ws = na.Workspace(project)
+    (project / "dup.py").write_text("x = 1\nx = 1\n")
+    na.read_file(ws, "dup.py")
+    with pytest.raises(na.ToolError, match="occurs 2 times"):
+        na.edit_file(ws, "dup.py", "x = 1", "x = 2")
+    assert na.edit_file(ws, "dup.py", "x = 1", "x = 2", replace_all=True).endswith("(2 replacements)")
+
 def test_paths_cannot_escape_the_project(project):
     ws = na.Workspace(project)
     with pytest.raises(na.ToolError, match="outside the project"):
