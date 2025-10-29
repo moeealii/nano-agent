@@ -156,6 +156,19 @@ def test_ambiguous_edit_is_rejected(project):
         na.edit_file(ws, "dup.py", "x = 1", "x = 2")
     assert na.edit_file(ws, "dup.py", "x = 1", "x = 2", replace_all=True).endswith("(2 replacements)")
 
+def test_parallel_reads_come_back_in_one_message_in_order(project):
+    client = FakeClient(
+        reply(call("a", "read_file", path="src/util.py"), call("b", "grep", pattern="def "), call("c", "glob", pattern="*.py")),
+        reply(text("ok")),
+    )
+    make_agent(project, client).run("look around")
+    results = client.requests[1]["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["a", "b", "c"]
+    assert "TODO = 1" in results[0]["content"]
+    assert "app.py:1: def add(a, b):" in results[1]["content"]
+    assert results[2]["content"].splitlines() == ["app.py", "src/util.py"]
+
+
 def test_paths_cannot_escape_the_project(project):
     ws = na.Workspace(project)
     with pytest.raises(na.ToolError, match="outside the project"):

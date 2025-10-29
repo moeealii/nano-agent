@@ -16,6 +16,7 @@ Run it:  python nano_agent.py "fix the failing test in tests/"
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import fnmatch
 import json
@@ -378,15 +379,25 @@ class Agent:
     # -- tools -------------------------------------------------------------
 
     def run_tools(self, calls: list[Any]) -> list[dict]:
-        # Tools run in the order the model asked for them.
-        return [self.execute(call) for call in calls]
+        results: dict[str, dict] = {}
+        parallel = []
+        for call in calls:
+            self.ui.line(f"> {summarize_call(call.name, call.input)}", UI.CYAN)
+            denied = self.perms.check(call.name, call.input)
+            if denied:
+                results[call.id] = self.error(call.id, denied)
+            elif call.name in READ_ONLY:
+                parallel.append(call)  # safe to run side by side
+            else:
+                results[call.id] = self.execute(call)  # writes run one at a time, in order
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for call, result in zip(parallel, pool.map(self.execute, parallel)):
+                results[call.id] = result
+        return [results[c.id] for c in calls]
 
     def execute(self, call: Any) -> dict:
         args, ws = call.input, self.ws
-        self.ui.line(f"> {summarize_call(call.name, call.input)}", UI.CYAN)
-        denied = self.perms.check(call.name, args)
-        if denied:
-            return self.error(call.id, denied)
         try:
             match call.name:
                 case "read_file": out = read_file(ws, **args)
