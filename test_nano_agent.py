@@ -186,6 +186,26 @@ def test_read_file_pages_long_files(project):
 
 # -- subagents ------------------------------------------------------------
 
+# -- subagents ------------------------------------------------------------
+
+
+def test_subagent_gets_read_only_tools_and_returns_its_answer(project):
+    client = FakeClient(
+        reply(call("t1", "task", description="find todos", prompt="Where are the TODOs?")),
+        reply(call("s1", "grep", pattern="TODO")),     # subagent's first turn
+        reply(text("src/util.py:1 has the only TODO")),  # subagent's answer
+        reply(text("there is one TODO")),
+    )
+    agent = make_agent(project, client)
+    assert agent.run("any todos?") == "there is one TODO"
+    child_req = client.requests[1]
+    assert {t["name"] for t in child_req["tools"]} == {"read_file", "grep", "glob"}
+    assert len(child_req["messages"]) == 1, "the subagent starts with a fresh context"
+    result = client.requests[3]["messages"][-1]["content"][0]
+    assert result["content"] == "src/util.py:1 has the only TODO"
+    assert agent.usage.output == 200, "subagent usage is counted in the parent's total"
+
+
 def test_ui_indents_every_line_of_subagent_output():
     out = io.StringIO()
     ui = na.UI(indent="  | ", out=out)

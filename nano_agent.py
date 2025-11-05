@@ -5,10 +5,11 @@ The loop is the whole idea: send the conversation, stream the reply, run any
 tools it asked for, append the results, repeat until the model stops asking.
 Everything else here exists to make that loop safe and able to run for a long time:
 
-  tools         read, write, edit, bash, grep, glob
+  tools         read, write, edit, bash, grep, glob, plus a subagent
   permissions   anything that changes the world asks first, paths stay in the project
   streaming     thinking, text and tool calls print as they are generated
   caching       the prompt prefix never changes mid-session, so it stays cached
+  subagents     a fresh agent with read-only tools explores and reports back
 
 Run it:  python nano_agent.py "fix the failing test in tests/"
 """
@@ -194,8 +195,12 @@ TOOL_SPECS = [
          {"pattern": S, "path": S, "glob": {**S, "description": "filename filter, e.g. *.py"}}, ["pattern"]),
     tool("glob", "List files whose project-relative path matches a glob, e.g. src/*.ts or *test*.",
          {"pattern": S}, ["pattern"]),
+    tool("task", "Hand a self-contained research question to a subagent with read-only tools and a fresh context. "
+                 "Use it to explore a large codebase without filling your own context. Returns its final answer.",
+         {"description": {**S, "description": "3-5 word label"}, "prompt": S}, ["description", "prompt"]),
 ]
-READ_ONLY = {"read_file", "grep", "glob"}
+READ_ONLY = {"read_file", "grep", "glob", "task"}
+SUBAGENT_TOOLS = ["read_file", "grep", "glob"]
 
 
 # ----------------------------------------------------------------------------
@@ -272,7 +277,7 @@ class UI:
 
 def summarize_call(name: str, args: dict) -> str:
     key = {"read_file": "path", "write_file": "path", "edit_file": "path", "bash": "command",
-           "grep": "pattern", "glob": "pattern"}.get(name)
+           "grep": "pattern", "glob": "pattern", "task": "description"}.get(name)
     detail = str(args.get(key, "")) if isinstance(args, dict) else ""
     return f"{name}({detail[:100]}{'...' if len(detail) > 100 else ''})"
 
@@ -406,6 +411,7 @@ class Agent:
                 case "bash": out = bash(ws, **args)
                 case "grep": out = grep(ws, **args)
                 case "glob": out = glob_files(ws, **args)
+                case "task": out = self.subagent(args["description"], args["prompt"])
                 case _: raise ToolError(f"unknown tool {call.name}")
         except ToolError as e:
             self.ui.line(f"  ! {e}", UI.RED)
@@ -420,6 +426,28 @@ class Agent:
     def error(tool_use_id: str, message: str) -> dict:
         return {"type": "tool_result", "tool_use_id": tool_use_id, "content": message, "is_error": True}
 
+    # -- subagents ---------------------------------------------------------
+
+    def subagent(self, description: str, prompt: str) -> str:
+        """A fresh agent with read-only tools. Only its final answer comes back."""
+        child = Agent(
+            client=self.client,
+            cfg=Config(**self.cfg.__dict__),
+            ws=self.ws,
+            perms=self.perms,
+            system=self.system + "\n\nYou are a subagent. Investigate, then reply with a complete, concise report. "
+                                 "Your final message is all the caller sees.",
+            tool_names=SUBAGENT_TOOLS,
+            ui=UI(indent=self.ui.indent + "  | ", quiet=self.ui.quiet, out=self.ui.out),
+        )
+        self.ui.line(f"  [subagent: {description}]", UI.DIM)
+        answer = child.run(prompt)
+        self.usage.input += child.usage.input
+        self.usage.output += child.usage.output
+        self.usage.cache_read += child.usage.cache_read
+        self.usage.cache_write += child.usage.cache_write
+        return answer or "(the subagent returned no answer)"
+
 def build_system(cfg: Config) -> str:
     shell = "cmd.exe" if platform.system() == "Windows" else "sh"
     return f"""You are nano-agent, a coding agent working in a user's project through tools.
@@ -433,6 +461,7 @@ How to work:
 - Make the smallest change that fully solves the task, in the style of the surrounding code.
 - Prefer edit_file for changes to existing files. Run the project's tests or build after changing code.
 - Call independent read-only tools in parallel in a single turn.
+- Use task to delegate broad searches so your own context stays focused.
 - If an action is refused, do not try to get around the refusal; ask the user.
 - When you finish, say what you changed and how you verified it, plainly. If something failed, say so.
 """
