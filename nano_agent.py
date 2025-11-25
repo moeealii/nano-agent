@@ -5,7 +5,7 @@ The loop is the whole idea: send the conversation, stream the reply, run any
 tools it asked for, append the results, repeat until the model stops asking.
 Everything else here exists to make that loop safe and able to run for a long time:
 
-  tools         read, write, edit, bash, grep, glob, plus a subagent
+  tools         read, write, edit, bash, grep, glob, plus a subagent and memory
   permissions   anything that changes the world asks first, paths stay in the project
   streaming     thinking, text and tool calls print as they are generated
   caching       the prompt prefix never changes mid-session, so it stays cached
@@ -35,8 +35,8 @@ import anthropic
 # ----------------------------------------------------------------------------
 # Configuration
 
-MODEL = "claude-sonnet-4-5"
-PRICES = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75}  # $/MTok, Sonnet 4.5
+MODEL = "claude-opus-4-5"
+PRICES = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}  # $/MTok, Opus 4.5
 MAX_TOOL_OUTPUT = 30_000  # characters of tool output the model gets back
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".mypy_cache"}
 
@@ -47,6 +47,7 @@ class Config:
     model: str = MODEL
     max_tokens: int = 32_000
     yolo: bool = False  # skip permission prompts (catastrophic commands stay blocked)
+    memory_file: str = "NANO.md"
 
 
 # ----------------------------------------------------------------------------
@@ -170,6 +171,15 @@ def glob_files(ws: Workspace, pattern: str) -> str:
     return "\n".join(matches[:1000]) or "no files match"
 
 
+def remember(ws: Workspace, note: str, memory_file: str) -> str:
+    # Saved for the *next* session. Changing the system prompt now would
+    # invalidate the prompt cache and the thinking blocks already in the history.
+    p = ws.root / memory_file
+    with p.open("a", encoding="utf-8") as f:
+        f.write(f"- {note.strip()}\n")
+    return f"saved to {memory_file}; it will be in your instructions next session"
+
+
 def tool(name: str, description: str, props: dict, required: list[str]) -> dict:
     return {
         "name": name,
@@ -198,6 +208,8 @@ TOOL_SPECS = [
     tool("task", "Hand a self-contained research question to a subagent with read-only tools and a fresh context. "
                  "Use it to explore a large codebase without filling your own context. Returns its final answer.",
          {"description": {**S, "description": "3-5 word label"}, "prompt": S}, ["description", "prompt"]),
+    tool("remember", "Save a durable fact about this project or the user's preferences for future sessions.",
+         {"note": S}, ["note"]),
 ]
 READ_ONLY = {"read_file", "grep", "glob", "task"}
 SUBAGENT_TOOLS = ["read_file", "grep", "glob"]
@@ -277,7 +289,7 @@ class UI:
 
 def summarize_call(name: str, args: dict) -> str:
     key = {"read_file": "path", "write_file": "path", "edit_file": "path", "bash": "command",
-           "grep": "pattern", "glob": "pattern", "task": "description"}.get(name)
+           "grep": "pattern", "glob": "pattern", "task": "description", "remember": "note"}.get(name)
     detail = str(args.get(key, "")) if isinstance(args, dict) else ""
     return f"{name}({detail[:100]}{'...' if len(detail) > 100 else ''})"
 
@@ -412,6 +424,7 @@ class Agent:
                 case "grep": out = grep(ws, **args)
                 case "glob": out = glob_files(ws, **args)
                 case "task": out = self.subagent(args["description"], args["prompt"])
+                case "remember": out = remember(ws, args["note"], self.cfg.memory_file)
                 case _: raise ToolError(f"unknown tool {call.name}")
         except ToolError as e:
             self.ui.line(f"  ! {e}", UI.RED)
@@ -449,6 +462,8 @@ class Agent:
         return answer or "(the subagent returned no answer)"
 
 def build_system(cfg: Config) -> str:
+    memory_path = cfg.root / cfg.memory_file
+    memory = memory_path.read_text(encoding="utf-8").strip() if memory_path.exists() else ""
     shell = "cmd.exe" if platform.system() == "Windows" else "sh"
     return f"""You are nano-agent, a coding agent working in a user's project through tools.
 
@@ -462,9 +477,10 @@ How to work:
 - Prefer edit_file for changes to existing files. Run the project's tests or build after changing code.
 - Call independent read-only tools in parallel in a single turn.
 - Use task to delegate broad searches so your own context stays focused.
+- Use remember for durable facts worth knowing next session (commands, conventions, preferences).
 - If an action is refused, do not try to get around the refusal; ask the user.
 - When you finish, say what you changed and how you verified it, plainly. If something failed, say so.
-"""
+""" + (f"\nProject memory ({cfg.memory_file}):\n{memory}\n" if memory else "")
 
 
 def repl(agent: Agent) -> None:

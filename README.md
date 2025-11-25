@@ -9,14 +9,14 @@ python nano_agent.py "the test in tests/test_dates.py fails on leap years, fix i
 python nano_agent.py            # interactive session
 ```
 
-Agent frameworks hide the parts that matter. This is the opposite: one file you can read top to bottom in twenty minutes, that still does what a real agent has to do. It reads and edits code, runs commands, asks before it changes anything, delegates research to subagents, and streams its thinking and tool calls as they happen.
+Agent frameworks hide the parts that matter. This is the opposite: one file you can read top to bottom in twenty minutes, that still does what a real agent has to do. It reads and edits code, runs commands, asks before it changes anything, delegates research to subagents, remembers things between sessions, and streams its thinking and tool calls as they happen.
 
 ## What's in the file
 
 | Section | What it does |
 |---|---|
 | **Workspace** | Resolves every model-supplied path and refuses anything outside the project root. Records the mtime of every file the model reads, so an edit to a file that changed since is rejected rather than silently clobbering it. |
-| **Tools** | `read_file`, `write_file`, `edit_file` (exact, unique string replacement), `bash`, `grep`, `glob`, `task` (subagent). Each is a plain function plus a JSON schema. |
+| **Tools** | `read_file`, `write_file`, `edit_file` (exact, unique string replacement), `bash`, `grep`, `glob`, `task` (subagent), `remember` (memory). Each is a plain function plus a JSON schema. |
 | **Permissions** | Read-only tools run freely. Writes and commands ask `[y]es / [n]o / [a]lways`. A short list of catastrophic commands (`rm -rf /`, `mkfs`, force-push, ...) is refused even with `--yolo`. |
 | **The loop** | Stream a reply, run the tools it asked for, append every result in one message, repeat. About 40 lines. |
 | **Subagents** | `task` starts a fresh agent with read-only tools. Only its final report comes back, so a broad search never floods the main context. |
@@ -25,7 +25,7 @@ Agent frameworks hide the parts that matter. This is the opposite: one file you 
 
 These are the decisions worth stealing.
 
-**The prompt prefix never changes mid-session.** The system prompt and tool list are fixed when the agent starts, and both are marked for prompt caching. A long session re-reads them every turn at cache prices.
+**The prompt prefix never changes mid-session.** The system prompt and tool list are fixed when the agent starts, and both are marked for prompt caching. A long session re-reads them every turn at cache prices. That's also why `remember` writes to `NANO.md` for the *next* session instead of editing the current system prompt: editing it would throw away the cache, and on current Claude models it would also invalidate every thinking block already in the history.
 
 **Parallel where it's safe.** The model can request several tools at once. Read-only ones run in a thread pool. Writes and commands run one at a time, in order, after their permission prompt. All results go back in a single message: splitting them teaches the model to stop calling tools in parallel.
 

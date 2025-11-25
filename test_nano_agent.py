@@ -83,7 +83,7 @@ def test_plain_answer_and_request_shape(project):
     agent = make_agent(project, client)
     assert agent.run("hi") == "hello"
     req = client.requests[0]
-    assert req["model"] == "claude-sonnet-4-5"
+    assert req["model"] == "claude-opus-4-5"
     assert req["thinking"] == {"type": "enabled", "budget_tokens": 8_000}
     assert req["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert all(t["eager_input_streaming"] for t in req["tools"])
@@ -131,6 +131,14 @@ def test_catastrophic_commands_are_refused_even_in_yolo(project):
     make_agent(project, client, yolo=True).run("clean up")
     result = client.requests[1]["messages"][-1]["content"][0]
     assert result["is_error"] and "never-run" in result["content"]
+
+
+def test_memory_is_loaded_into_the_system_prompt(project):
+    (project / "NANO.md").write_text("- tests run with `pytest -q`\n")
+    system = na.build_system(na.Config(root=project))
+    assert "tests run with `pytest -q`" in system
+    na.remember(na.Workspace(project), "use tabs", "NANO.md")
+    assert (project / "NANO.md").read_text().endswith("- use tabs\n")
 
 
 # -- workspace safety ------------------------------------------------------
