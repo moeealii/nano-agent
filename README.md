@@ -9,7 +9,7 @@ python nano_agent.py "the test in tests/test_dates.py fails on leap years, fix i
 python nano_agent.py            # interactive session
 ```
 
-Agent frameworks hide the parts that matter. This is the opposite: one file you can read top to bottom in twenty minutes, that still does what a real agent has to do. It reads and edits code, runs commands, asks before it changes anything, delegates research to subagents, remembers things between sessions, and streams its thinking and tool calls as they happen.
+Agent frameworks hide the parts that matter. This is the opposite: one file you can read top to bottom in twenty minutes, that still does what a real agent has to do. It reads and edits code, runs commands, asks before it changes anything, delegates research to subagents, remembers things between sessions, keeps working when the conversation outgrows the context window, and streams its thinking and tool calls as they happen.
 
 ## What's in the file
 
@@ -20,6 +20,7 @@ Agent frameworks hide the parts that matter. This is the opposite: one file you 
 | **Permissions** | Read-only tools run freely. Writes and commands ask `[y]es / [n]o / [a]lways`. A short list of catastrophic commands (`rm -rf /`, `mkfs`, force-push, ...) is refused even with `--yolo`. |
 | **The loop** | Stream a reply, run the tools it asked for, append every result in one message, repeat. About 40 lines. |
 | **Subagents** | `task` starts a fresh agent with read-only tools. Only its final report comes back, so a broad search never floods the main context. |
+| **Compaction** | Near the context limit, the whole history becomes one summary. |
 
 ## Design notes
 
@@ -29,15 +30,17 @@ These are the decisions worth stealing.
 
 **Parallel where it's safe.** The model can request several tools at once. Read-only ones run in a thread pool. Writes and commands run one at a time, in order, after their permission prompt. All results go back in a single message: splitting them teaches the model to stop calling tools in parallel.
 
+**Compaction is "simple compaction".** When the last request was over `--compact-at` tokens (150k by default), the agent asks the model for a structured summary. It then replaces the entire history with that one message, replaying no old turns and no old thinking blocks. Keeping the last few turns verbatim looks smarter but breaks: those turns' thinking was produced alongside history that no longer exists. Compaction only runs between tool rounds, never while a tool call is waiting for its result. A brand-new user request is kept word for word after the summary, not summarised away.
+
 **Failure is information.** Tool errors and refused permissions come back as `is_error` tool results with a reason the model can act on. Nothing in a tool can crash the session, and Ctrl-C drops the half-finished turn so the history stays valid.
 
 ## Options
 
 ```
-python nano_agent.py [prompt ...] [--root DIR] [--model MODEL] [--yolo]
+python nano_agent.py [prompt ...] [--root DIR] [--model MODEL] [--yolo] [--compact-at TOKENS]
 ```
 
-In an interactive session, `/cost` shows tokens and dollars so far, and `/exit` quits.
+In an interactive session, `/cost` shows tokens and dollars so far, `/compact` compacts now, and `/exit` quits.
 
 The default model is `claude-sonnet-4-5`.
 

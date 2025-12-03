@@ -9,6 +9,7 @@ Everything else here exists to make that loop safe and able to run for a long ti
   permissions   anything that changes the world asks first, paths stay in the project
   streaming     thinking, text and tool calls print as they are generated
   caching       the prompt prefix never changes mid-session, so it stays cached
+  compaction    near the context limit, the history is replaced by one summary
   subagents     a fresh agent with read-only tools explores and reports back
 
 Run it:  python nano_agent.py "fix the failing test in tests/"
@@ -46,6 +47,7 @@ class Config:
     root: Path
     model: str = MODEL
     max_tokens: int = 32_000
+    compact_at: int = 150_000  # input tokens; compaction runs above this
     yolo: bool = False  # skip permission prompts (catastrophic commands stay blocked)
     memory_file: str = "NANO.md"
 
@@ -294,6 +296,23 @@ def summarize_call(name: str, args: dict) -> str:
     return f"{name}({detail[:100]}{'...' if len(detail) > 100 else ''})"
 
 
+SUMMARY_PROMPT = (
+    "Summarize the transcript inside <summary></summary> tags. Include relevant information in the summary such "
+    "that this conversation will be continued by a new context window without needing to redo work or be "
+    "reprovided with relevant constraints or context. Be sure to preserve: (1) any difficulties or problems that "
+    "came up, and how they were handled or resolved; (2) any possibilities, options, or approaches that were "
+    "raised, tried, or set aside, and why; (3) anything that was asked for, decided, agreed, ruled out, or "
+    "established as a preference, constraint, or boundary - stated exactly; (4) exactly where things stand now - "
+    "what has been covered, settled, or completed so far; (5) anything still open, unresolved, promised, or "
+    "expected to happen next; (6) specific details that would be hard to reconstruct - names, numbers, dates, "
+    "exact wording, links or references - kept exactly. Be complete on these even at the cost of length; keep "
+    "everything else concise. Weight the two voices differently: keep what the user said, asked for, shared, or "
+    "established carefully and close to their own words; your own explanations and reasoning can be condensed "
+    "much further, to what they concluded or produced - as long as nothing in the six items above is dropped. "
+    "Do not call any tools while writing this summary; respond with text only."
+)
+
+
 @dataclass
 class Usage:
     input: int = 0
@@ -342,6 +361,7 @@ class Agent:
     def run(self, prompt: str) -> str:
         self.messages.append({"role": "user", "content": prompt})
         while True:
+            self.maybe_compact()
             reply = self.request()
             self.messages.append({"role": "assistant", "content": reply.content})
             calls = [b for b in reply.content if b.type == "tool_use"]
@@ -392,6 +412,46 @@ class Agent:
                 self.ui.line("[malformed tool input from the model; retrying]", UI.RED)
                 if attempt == 2:
                     raise
+
+    # -- compaction --------------------------------------------------------
+
+    def maybe_compact(self, force: bool = False) -> bool:
+        """
+        Near the context limit, replace the whole history with one summary.
+
+        This is "simple compaction": nothing from before the summary is
+        replayed - no old turns, no old thinking blocks - so nothing carried
+        over is tied to a transcript that no longer exists. It never runs in
+        the middle of a tool round, and a brand-new user prompt is kept verbatim
+        after the summary rather than summarized away.
+        """
+        if not force and self.usage.last_context < self.cfg.compact_at:
+            return False
+        last = self.messages[-1] if self.messages else None
+        if last is None or (last["role"] == "assistant" and any(
+                getattr(b, "type", None) == "tool_use" for b in last["content"])):
+            return False  # a tool call is still waiting for its result
+        new_prompt = self.messages.pop()["content"] if isinstance(last["content"], str) and last["role"] == "user" else None
+        if not self.messages:
+            self.messages.append({"role": "user", "content": new_prompt})
+            return False  # nothing before it to summarize
+
+        self.ui.line(f"[compacting {self.usage.last_context:,} tokens of history]", UI.DIM)
+        quiet, self.ui.quiet = self.ui.quiet, True
+        try:
+            reply = self.request(extra=[{"role": "user", "content": SUMMARY_PROMPT}])
+        finally:
+            self.ui.quiet = quiet
+        text = "".join(b.text for b in reply.content if b.type == "text")
+        match = re.search(r"<summary>(.*)</summary>", text, re.S)
+        summary = (match.group(1) if match else text).strip()
+        content = f"This session was compacted. Summary of everything so far:\n\n<summary>\n{summary}\n</summary>\n\n"
+        content += (f"New request:\n{new_prompt}" if new_prompt is not None
+                    else "Continue from where things stand, without redoing finished work.")
+        self.messages = [{"role": "user", "content": content}]
+        self.usage.last_context = 0
+        self.ui.line(f"[compacted to {len(summary):,} characters]", UI.DIM)
+        return True
 
     # -- tools -------------------------------------------------------------
 
@@ -485,7 +545,7 @@ How to work:
 
 def repl(agent: Agent) -> None:
     print(f"nano-agent ({agent.cfg.model}) in {agent.cfg.root}")
-    print("Commands: /cost  /exit\n")
+    print("Commands: /cost  /compact  /exit\n")
     while True:
         try:
             prompt = input(f"{UI.BOLD}> {UI.RESET}").strip()
@@ -496,6 +556,10 @@ def repl(agent: Agent) -> None:
             return
         if prompt == "/cost":
             print(agent.usage)
+            continue
+        if prompt == "/compact":
+            if not agent.maybe_compact(force=True):
+                print("nothing to compact yet")
             continue
         if prompt:
             turn(agent, prompt)
@@ -528,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=".", help="project directory (default: current)")
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--yolo", action="store_true", help="don't ask before writes and commands")
+    ap.add_argument("--compact-at", type=int, default=150_000, help="compact above this many input tokens")
     a = ap.parse_args(argv)
 
     # The SDK finds credentials in env vars or an `ant auth login` profile; fail early if there are none.
@@ -536,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
         print("nano-agent: no Anthropic credentials. Set ANTHROPIC_API_KEY, or run `ant auth login`.", file=sys.stderr)
         return 1
 
-    cfg = Config(root=Path(a.root).resolve(), model=a.model, yolo=a.yolo)
+    cfg = Config(root=Path(a.root).resolve(), model=a.model, yolo=a.yolo, compact_at=a.compact_at)
     agent = Agent(client=anthropic.Anthropic(), cfg=cfg, ws=Workspace(cfg.root),
                   perms=Permissions(cfg.yolo), system=build_system(cfg))
     if a.prompt:

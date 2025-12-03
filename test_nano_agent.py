@@ -192,6 +192,37 @@ def test_read_file_pages_long_files(project):
 
 # -- compaction -------------------------------------------------------------
 
+# -- compaction -------------------------------------------------------------
+
+
+def test_compaction_replaces_history_and_keeps_the_new_prompt(project):
+    client = FakeClient(
+        reply(text("first answer"), tokens=200_000),
+        reply(text("<summary>user wants add() fixed; nothing changed yet</summary>")),
+        reply(text("second answer")),
+    )
+    agent = make_agent(project, client, compact_at=150_000)
+    agent.run("first question")
+    assert agent.run("second question") == "second answer"
+
+    summarize = client.requests[1]
+    assert summarize["messages"][-1]["content"] == na.SUMMARY_PROMPT
+    assert summarize["tools"] == client.requests[0]["tools"], "tools stay identical, even for the summary"
+
+    after = client.requests[2]["messages"]
+    assert len(after) == 1, "nothing from before the summary is replayed"
+    assert "user wants add() fixed" in after[0]["content"]
+    assert after[0]["content"].endswith("New request:\nsecond question")
+
+
+def test_compaction_never_splits_a_tool_round(project):
+    agent = make_agent(project, FakeClient(), compact_at=1)
+    agent.usage.last_context = 10
+    agent.messages = [{"role": "user", "content": "go"},
+                      {"role": "assistant", "content": [call("t1", "read_file", path="app.py")]}]
+    assert agent.maybe_compact() is False
+
+
 # -- subagents ------------------------------------------------------------
 
 # -- subagents ------------------------------------------------------------
