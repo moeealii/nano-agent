@@ -32,7 +32,9 @@ These are the decisions worth stealing.
 
 **Compaction is "simple compaction".** When the last request was over `--compact-at` tokens (150k by default), the agent asks the model for a structured summary. It then replaces the entire history with that one message, replaying no old turns and no old thinking blocks. Keeping the last few turns verbatim looks smarter but breaks: those turns' thinking was produced alongside history that no longer exists. Compaction only runs between tool rounds, never while a tool call is waiting for its result. A brand-new user request is kept word for word after the summary, not summarised away.
 
-**Failure is information.** Tool errors and refused permissions come back as `is_error` tool results with a reason the model can act on. Nothing in a tool can crash the session, and Ctrl-C drops the half-finished turn so the history stays valid.
+**Tool inputs stream, so they're validated by hand.** Tools set `eager_input_streaming`, so a 400-line `write_file` starts arriving immediately instead of after a long silence. The cost is that the API no longer validates those inputs. `validate_input()` checks every call against its schema before it runs. A call cut off by `max_tokens` is never executed, even when the truncated JSON happens to parse. Bad inputs go back to the model as errors it can fix.
+
+**Failure is information.** Tool errors, refused permissions, invalid input and stale-file edits come back as `is_error` tool results with a reason the model can act on. Nothing in a tool can crash the session, and Ctrl-C drops the half-finished turn so the history stays valid.
 
 ## Options
 
@@ -51,6 +53,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-The tests drive the real loop against a scripted fake client, so they run offline in about 2 seconds. They check the request shape, the read, edit and fix flow, permissions (decline, always, the never-run list), path escapes, tool errors, and the interactive output.
+The tests drive the real loop against a scripted fake client, so they run offline in about 2 seconds. They check the request shape, the read, edit and fix flow, permissions (decline, always, the never-run list), path escapes, stale and ambiguous edits, invalid and truncated tool input, refusals, parallel result ordering, malformed-JSON retries, compaction (prefix unchanged, nothing replayed, new prompt kept, never mid-round), subagents (read-only tools, fresh context, usage rolled up) and memory.
 
 MIT licensed.

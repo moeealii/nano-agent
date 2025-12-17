@@ -217,6 +217,25 @@ READ_ONLY = {"read_file", "grep", "glob", "task"}
 SUBAGENT_TOOLS = ["read_file", "grep", "glob"]
 
 
+def validate_input(spec: dict, args: Any) -> str | None:
+    """Minimal JSON-schema check: right keys, right types. Returns an error or None."""
+    schema = spec["input_schema"]
+    if not isinstance(args, dict):
+        return "input must be an object"
+    for key in schema["required"]:
+        if key not in args:
+            return f"missing required field: {key}"
+    types = {"string": str, "integer": int, "boolean": bool}
+    for key, value in args.items():
+        prop = schema["properties"].get(key)
+        if prop is None:
+            return f"unknown field: {key}"
+        expected = types[prop["type"]]
+        if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+            return f"{key} must be a {prop['type']}"
+    return None
+
+
 # ----------------------------------------------------------------------------
 # Permissions: read-only tools just run. Anything else asks, unless --yolo.
 # A few commands are refused outright, --yolo or not.
@@ -460,6 +479,11 @@ class Agent:
         parallel = []
         for call in calls:
             self.ui.line(f"> {summarize_call(call.name, call.input)}", UI.CYAN)
+            spec = self.specs.get(call.name)
+            problem = ("unknown tool" if spec is None else validate_input(spec, call.input))
+            if problem:
+                results[call.id] = self.error(call.id, json.dumps({"INVALID_INPUT": problem, "received": call.input}))
+                continue
             denied = self.perms.check(call.name, call.input)
             if denied:
                 results[call.id] = self.error(call.id, denied)

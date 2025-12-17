@@ -177,6 +177,34 @@ def test_parallel_reads_come_back_in_one_message_in_order(project):
     assert results[2]["content"].splitlines() == ["app.py", "src/util.py"]
 
 
+def test_invalid_input_is_returned_not_run(project):
+    client = FakeClient(reply(call("t1", "write_file", path="x.py", content=42)), reply(text("ok")))
+    make_agent(project, client, yolo=True).run("go")
+    assert not (project / "x.py").exists()
+    assert "INVALID_INPUT" in client.requests[1]["messages"][-1]["content"][0]["content"]
+
+
+def test_truncated_tool_call_is_never_run(project):
+    client = FakeClient(reply(call("t1", "write_file", path="x.py", content="part"), stop="max_tokens"),
+                        reply(text("ok")))
+    make_agent(project, client, yolo=True).run("go")
+    assert not (project / "x.py").exists()
+    assert "max_tokens" in client.requests[1]["messages"][-1]["content"][0]["content"]
+
+
+def test_refusal_answers_pending_calls_and_stops(project):
+    client = FakeClient(reply(call("t1", "bash", command="echo hi"), stop="refusal"))
+    agent = make_agent(project, client, yolo=True)
+    assert agent.run("go") == ""
+    assert agent.messages[-1]["content"][0]["is_error"]
+
+
+def test_malformed_tool_json_is_retried(project):
+    client = FakeClient(ValueError("bad json"), reply(text("recovered")))
+    assert make_agent(project, client).run("go") == "recovered"
+    assert len(client.requests) == 2
+
+
 def test_paths_cannot_escape_the_project(project):
     ws = na.Workspace(project)
     with pytest.raises(na.ToolError, match="outside the project"):
