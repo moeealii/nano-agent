@@ -53,6 +53,7 @@ class FakeClient:
         self.replies = list(replies)
         self.requests = []
         self.messages = NS(stream=self.stream)
+        self.beta = NS(messages=self.messages)
 
     def stream(self, **kwargs):
         # Deep-copy what was sent: the agent keeps mutating its history afterwards.
@@ -71,8 +72,9 @@ def project(tmp_path):
 def make_agent(root, client, answers=(), yolo=False, **cfg):
     answers = list(answers)
     perms = na.Permissions(yolo=yolo, ask=lambda _q: answers.pop(0))
-    config = na.Config(root=root, yolo=yolo, **cfg)
-    return na.Agent(client=client, cfg=config, ws=na.Workspace(root), perms=perms,
+    config = na.Config(root=root, yolo=yolo, provider="anthropic", **cfg)
+    provider = na.build_provider(config, client=client)
+    return na.Agent(provider=provider, cfg=config, ws=na.Workspace(root), perms=perms,
                     system="test system", ui=na.UI(quiet=True))
 
 
@@ -282,3 +284,97 @@ def test_ui_indents_every_line_of_subagent_output():
     ui.end_stream()
     reset = na.UI.RESET
     assert out.getvalue() == f"  | hello\n  | {reset}streamed across chunks\n  | and lines{reset}\n"
+
+
+# -- providers -------------------------------------------------------------
+
+class FakeOpenAI:
+    """Replays OpenAI chat-completion chunks, including fragmented tool calls."""
+
+    def __init__(self, *chunks):
+        self.chunks = list(chunks)
+        self.requests = []
+        self.chat = NS(completions=NS(create=self.create))
+
+    def create(self, **kwargs):
+        self.requests.append(copy.deepcopy(kwargs))
+        return iter(self.chunks.pop(0))
+
+
+def chunk(*choices, usage=None):
+    return NS(choices=list(choices), usage=usage)
+
+
+def oa_choice(content=None, reasoning=None, calls=None, finish=None):
+    delta = NS(content=content, reasoning_content=reasoning,
+               tool_calls=[NS(index=i, id=c["id"], function=NS(name=c.get("name", ""), arguments=c["args"]))
+                           for i, c in enumerate(calls or [])])
+    return NS(delta=delta, finish_reason=finish)
+
+
+def make_openai_agent(root, client, **cfg):
+    config = na.Config(root=root, provider="openai", **cfg)
+    provider = na.build_provider(config, client=client)
+    return na.Agent(provider=provider, cfg=config, ws=na.Workspace(root),
+                    perms=na.Permissions(yolo=True), system="test system", ui=na.UI(quiet=True))
+
+
+def test_openai_provider_runs_the_same_loop(project):
+    client = FakeOpenAI(
+        [chunk(oa_choice(reasoning="let me look", content="reading it")),
+         chunk(oa_choice(calls=[{"id": "c1", "name": "read_file", "args": "{\"path\": \"app.py\"}"}],
+                         finish="tool_calls")),
+         chunk(oa_choice(), usage=NS(prompt_tokens=120, completion_tokens=7,
+                                     prompt_tokens_details=NS(cached_tokens=20)))],
+        [chunk(oa_choice(content="it subtracts"), usage=NS(prompt_tokens=200, completion_tokens=9))],
+    )
+    agent = make_openai_agent(project, client)
+    assert agent.run("what does add do?") == "it subtracts"
+
+    first = client.requests[0]
+    assert first["messages"][0] == {"role": "system", "content": "test system"}
+    assert first["tools"][0]["type"] == "function"
+    assert first["tools"][0]["function"]["parameters"]["type"] == "object"
+    assert first["stream"] is True
+
+    # the tool result went back as an OpenAI `tool` message, and usage was counted
+    second = client.requests[1]["messages"]
+    assert second[-1]["role"] == "tool" and second[-1]["tool_call_id"] == "c1"
+    assert "def add" in second[-1]["content"]
+    assert second[-2]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert agent.usage.input == 320 and agent.usage.cache_read == 20
+
+
+def test_openai_tool_errors_are_labelled_in_the_transcript(project):
+    client = FakeOpenAI(
+        [chunk(oa_choice(calls=[{"id": "c1", "name": "bash", "args": "{\"command\": \"rm -rf /\"}"}],
+                         finish="tool_calls"))],
+        [chunk(oa_choice(content="ok"))],
+    )
+    make_openai_agent(project, client).run("go")
+    assert client.requests[1]["messages"][-1]["content"].startswith("ERROR:")
+
+
+def test_bad_tool_arguments_are_retried(project):
+    client = FakeOpenAI(
+        [chunk(oa_choice(calls=[{"id": "c1", "name": "read_file", "args": "{not json"}],
+                         finish="tool_calls"))],
+        [chunk(oa_choice(content="recovered"))],
+    )
+    assert make_openai_agent(project, client).run("go") == "recovered"
+
+
+def test_provider_selection_from_model_or_env(monkeypatch):
+    assert na.provider_for("auto", "gpt-5.2") == "openai"
+    assert na.provider_for("auto", "claude-opus-5-5") == "anthropic"
+    assert na.provider_for("openai", "claude-opus-5-5") == "openai"
+    monkeypatch.setenv("NANO_PROVIDER", "openai")
+    assert na.provider_for("auto", "claude-opus-5-5") == "openai"
+
+
+def test_provider_defaults_fill_in_a_model(project):
+    cfg = na.Config(root=project, provider="openai", model=None)
+    provider = na.build_provider(cfg, client=FakeOpenAI())
+    assert cfg.model == na.OpenAIProvider.default_model and provider.name == "openai"
+    with pytest.raises(na.AgentError, match="unknown provider"):
+        na.build_provider(na.Config(root=project, provider="nope"))

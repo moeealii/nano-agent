@@ -8,6 +8,7 @@ Everything else here exists to make that loop safe and able to run for a long ti
   tools         read, write, edit, bash, grep, glob, plus a subagent and memory
   permissions   anything that changes the world asks first, paths stay in the project
   streaming     thinking, text and tool calls print as they are generated
+  providers     Anthropic, or any OpenAI-compatible endpoint; the loop is the same
   caching       the prompt prefix never changes mid-session, so it stays cached
   compaction    near the context limit, the history is replaced by one summary
   subagents     a fresh agent with read-only tools explores and reports back
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime
 import fnmatch
 import json
@@ -29,14 +31,13 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
-
-import anthropic
 
 # ----------------------------------------------------------------------------
 # Configuration
 
-MODEL = "claude-opus-4-5"
+MODEL = os.environ.get("NANO_MODEL")  # None means the chosen provider's default
 PRICES = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}  # $/MTok, Opus 4.5
 MAX_TOOL_OUTPUT = 30_000  # characters of tool output the model gets back
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".mypy_cache"}
@@ -45,11 +46,16 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "bu
 @dataclass
 class Config:
     root: Path
-    model: str = MODEL
-    max_tokens: int = 32_000
+    model: str | None = MODEL
+    provider: str = "auto"  # anthropic | openai | auto (from NANO_PROVIDER or the model name)
+    max_tokens: int = 64_000
     compact_at: int = 150_000  # input tokens; compaction runs above this
     yolo: bool = False  # skip permission prompts (catastrophic commands stay blocked)
     memory_file: str = "NANO.md"
+
+    @property
+    def provider_label(self) -> str:
+        return f"{self.provider}:{self.model}"
 
 
 # ----------------------------------------------------------------------------
@@ -315,6 +321,9 @@ def summarize_call(name: str, args: dict) -> str:
     return f"{name}({detail[:100]}{'...' if len(detail) > 100 else ''})"
 
 
+# ----------------------------------------------------------------------------
+# The agent loop.
+
 SUMMARY_PROMPT = (
     "Summarize the transcript inside <summary></summary> tags. Include relevant information in the summary such "
     "that this conversation will be continued by a new context window without needing to redo work or be "
@@ -340,26 +349,250 @@ class Usage:
     cache_write: int = 0
     last_context: int = 0  # size of the most recent request: what compaction watches
 
-    def add(self, u: Any) -> None:
-        self.input += u.input_tokens or 0
-        self.output += u.output_tokens or 0
-        self.cache_read += getattr(u, "cache_read_input_tokens", 0) or 0
-        self.cache_write += getattr(u, "cache_creation_input_tokens", 0) or 0
-        self.last_context = ((u.input_tokens or 0) + (getattr(u, "cache_read_input_tokens", 0) or 0)
-                             + (getattr(u, "cache_creation_input_tokens", 0) or 0))
+    def add(self, input: int = 0, output: int = 0, cache_read: int = 0, cache_write: int = 0) -> None:
+        self.input += input or 0
+        self.output += output or 0
+        self.cache_read += cache_read or 0
+        self.cache_write += cache_write or 0
+        self.last_context = (input or 0) + (cache_read or 0) + (cache_write or 0)
 
-    def cost(self) -> float:
-        return (self.input * PRICES["input"] + self.output * PRICES["output"]
-                + self.cache_read * PRICES["cache_read"] + self.cache_write * PRICES["cache_write"]) / 1e6
+    def cost(self, prices: dict[str, float] | None = None) -> float:
+        p = prices or PRICES
+        return (self.input * p["input"] + self.output * p["output"]
+                + self.cache_read * p["cache_read"] + self.cache_write * p["cache_write"]) / 1e6
 
     def __str__(self) -> str:
         return (f"{self.input + self.cache_read + self.cache_write:,} in ({self.cache_read:,} cached) / "
                 f"{self.output:,} out, ${self.cost():.2f}")
 
 
+# ----------------------------------------------------------------------------
+# Providers. The agent keeps one normalized transcript - text, thinking, tool
+# calls, tool results - and an adapter translates it to whatever wire format the
+# chosen backend speaks. Anthropic and any OpenAI-compatible endpoint are here;
+# adding another is one adapter, not a change to the loop.
+
+
+def block(kind: str, **kw: Any) -> Any:
+    return SimpleNamespace(type=kind, **kw)
+
+
+@dataclass
+class Reply:
+    content: list[Any]
+    stop_reason: str | None = None
+    usage: Any = None
+
+
+class Provider:
+    name = "provider"
+    default_model = ""
+    prices = PRICES
+
+    def __init__(self, client: Any = None, cfg: Config | None = None):
+        self.client, self.cfg = client, cfg
+        self.agent: Any = None  # set by Agent; gives the adapter the transcript, tools and UI
+
+    def stream(self, messages: list[dict], extra: list[dict] | None = None) -> Reply:
+        raise NotImplementedError
+
+
+class AnthropicProvider(Provider):
+    name = "anthropic"
+    default_model = "claude-opus-4-5"
+    prices = PRICES
+
+    def stream(self, messages: list[dict], extra: list[dict] | None = None) -> Reply:
+        agent = self.agent
+        cfg, ui = agent.cfg, agent.ui
+        with self.client.beta.messages.stream(
+            model=cfg.model,
+            max_tokens=cfg.max_tokens,
+            system=[{"type": "text", "text": agent.system, "cache_control": {"type": "ephemeral"}}],
+            tools=agent.tools,
+            messages=messages + (extra or []),
+            thinking={"type": "enabled", "budget_tokens": 8_000},
+        ) as stream:
+            for event in stream:
+                if event.type == "thinking":
+                    ui.stream("thinking", event.thinking)
+                elif event.type == "text":
+                    ui.stream("text", event.text)
+            reply = stream.get_final_message()
+        u = reply.usage
+        return Reply(
+            content=list(reply.content),
+            stop_reason=reply.stop_reason,
+            usage=dict(input=u.input_tokens, output=u.output_tokens,
+                       cache_read=getattr(u, "cache_read_input_tokens", 0) or 0,
+                       cache_write=getattr(u, "cache_creation_input_tokens", 0) or 0),
+        )
+
+
+TOOL_RESULT_HEADER = "tool result"
+
+
+class OpenAIProvider(Provider):
+    """Any OpenAI-compatible /chat/completions endpoint: OpenAI, OpenRouter, vLLM, Ollama."""
+
+    name = "openai"
+    default_model = "gpt-4.1"
+    # OpenAI-compatible endpoints rarely bill at these prices; treat them as an estimate.
+    prices = {"input": 2.00, "output": 8.00, "cache_read": 0.50, "cache_write": 2.00}
+
+    @staticmethod
+    def _tools(specs: list[dict]) -> list[dict]:
+        return [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+                                                  "parameters": t["input_schema"]}} for t in specs]
+
+    @staticmethod
+    def _field(b: Any, key: str, default: Any = None) -> Any:
+        """Transcript blocks are objects from the SDK adapter and dicts from the tool loop."""
+        return b.get(key, default) if isinstance(b, dict) else getattr(b, key, default)
+
+    @classmethod
+    def _messages(cls, system: str, messages: list[dict]) -> list[dict]:
+        out: list[dict] = [{"role": "system", "content": system}]
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, str):
+                out.append({"role": msg["role"], "content": content})
+                continue
+            if msg["role"] == "assistant":
+                text, calls = [], []
+                for b in content:
+                    kind = cls._field(b, "type")
+                    if kind == "text":
+                        text.append(cls._field(b, "text", ""))
+                    elif kind == "tool_use":
+                        calls.append({"id": cls._field(b, "id"), "type": "function",
+                                      "function": {"name": cls._field(b, "name"),
+                                                   "arguments": json.dumps(cls._field(b, "input") or {})}})
+                out.append({"role": "assistant", "content": "\n".join(text) or None,
+                            **({"tool_calls": calls} if calls else {})})
+            else:  # tool results, one message each, as the API requires
+                for b in content:
+                    if cls._field(b, "type") != "tool_result":
+                        continue
+                    value = cls._field(b, "content", "")
+                    value = value if isinstance(value, str) else json.dumps(value)
+                    if cls._field(b, "is_error", False):
+                        value = f"ERROR: {value}"
+                    out.append({"role": "tool", "tool_call_id": cls._field(b, "tool_use_id"), "content": value})
+        return out
+
+    def stream(self, messages: list[dict], extra: list[dict] | None = None) -> Reply:
+        agent = self.agent
+        cfg, ui = agent.cfg, agent.ui
+        kwargs: dict[str, Any] = dict(model=cfg.model,
+                                      messages=self._messages(agent.system, messages + (extra or [])),
+                                      max_tokens=cfg.max_tokens, tools=self._tools(agent.tools), stream=True,
+                                      stream_options={"include_usage": True})
+        try:
+            stream = self.client.chat.completions.create(**kwargs)
+        except TypeError:  # a compatible server that doesn't know stream_options
+            kwargs.pop("stream_options", None)
+            stream = self.client.chat.completions.create(**kwargs)
+
+        text: list[str] = []
+        calls: dict[int, dict] = {}
+        stop = None
+        usage: dict[str, int] = {}
+        for chunk in stream:
+            raw_usage = getattr(chunk, "usage", None)
+            if raw_usage:
+                details = getattr(raw_usage, "prompt_tokens_details", None)
+                usage = dict(input=getattr(raw_usage, "prompt_tokens", 0) or 0,
+                             output=getattr(raw_usage, "completion_tokens", 0) or 0,
+                             cache_read=(getattr(details, "cached_tokens", 0) or 0) if details else 0)
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = choice.delta
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if isinstance(reasoning, str) and reasoning:
+                    ui.stream("thinking", reasoning)
+                if getattr(delta, "content", None):
+                    text.append(delta.content)
+                    ui.stream("text", delta.content)
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                    slot["id"] = tc.id or slot["id"]
+                    if getattr(tc.function, "name", None):
+                        slot["name"] += tc.function.name
+                    if getattr(tc.function, "arguments", None):
+                        slot["args"] += tc.function.arguments
+                stop = choice.finish_reason or stop
+
+        content: list[Any] = []
+        if any(text):
+            content.append(block("text", text="".join(text)))
+        for slot in calls.values():
+            try:
+                parsed = json.loads(slot["args"] or "{}")
+            except json.JSONDecodeError as e:
+                raise ValueError(f"bad tool arguments: {e}") from e
+            content.append(block("tool_use", id=slot["id"] or f"call_{len(content)}", name=slot["name"],
+                                 input=parsed))
+        # OpenAI says "length" where Anthropic says "max_tokens"; the loop handles both.
+        stop_reason = {"tool_calls": "tool_use", "length": "max_tokens"}.get(stop or "", stop or "end_turn")
+        if calls and stop_reason == "end_turn":
+            stop_reason = "tool_use"
+        return Reply(content=content, stop_reason=stop_reason,
+                     usage={"input": usage.get("input", 0), "output": usage.get("output", 0),
+                            "cache_read": usage.get("cache_read", 0), "cache_write": 0})
+
+
+PROVIDERS = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
+
+
+class AgentError(Exception):
+    """A failure to show the user as one line instead of a traceback."""
+
+
+def provider_for(name: str, model: str | None) -> str:
+    """Pick a backend: the explicit flag, then the environment, then the model name."""
+    if name and name != "auto":
+        return name
+    env = os.environ.get("NANO_PROVIDER")
+    if env:
+        return env
+    m = (model or "").lower()
+    if m.startswith(("claude", "anthropic")):
+        return "anthropic"
+    if m.startswith(("gpt", "o1", "o3", "o4", "openai")):
+        return "openai"
+    return "anthropic"
+
+
+def credentials_present(kind: str) -> bool:
+    if kind == "anthropic":
+        return bool(
+            any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"))
+            or (Path.home() / ".config" / "anthropic").is_dir()
+        )
+    return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_BASE_URL"))
+
+
+def build_provider(cfg: Config, client: Any = None) -> Provider:
+    kind = provider_for(cfg.provider, cfg.model)
+    if kind not in PROVIDERS:
+        raise AgentError(f"unknown provider {kind!r}; choose one of {', '.join(PROVIDERS)}")
+    cfg.provider = kind
+    cls = PROVIDERS[kind]
+    cfg.model = cfg.model or cls.default_model
+    if client is None:
+        if kind == "anthropic":
+            import anthropic as sdk
+            client = sdk.Anthropic()
+        else:
+            import openai as sdk
+            client = sdk.OpenAI(base_url=os.environ.get("OPENAI_BASE_URL") or None,
+                                api_key=os.environ.get("OPENAI_API_KEY") or "not-needed")
+    return cls(client=client, cfg=cfg)
+
+
 @dataclass
 class Agent:
-    client: Any
+    provider: Provider
     cfg: Config
     ws: Workspace
     perms: Permissions
@@ -374,6 +607,9 @@ class Agent:
         # would throw away the prompt cache and every thinking block so far.
         self.tools = [t for t in TOOL_SPECS if t["name"] in self.tool_names]
         self.specs = {t["name"]: t for t in self.tools}
+        # The adapter serves this agent only: it needs the system prompt, tool
+        # list and UI, all of which are fixed for the life of a session too.
+        self.provider.cfg, self.provider.agent = self.cfg, self
 
     # -- one user turn: loop until the model stops calling tools ------------
 
@@ -394,7 +630,7 @@ class Agent:
                 return ""
             if not calls:
                 return "".join(b.text for b in reply.content if b.type == "text")
-            if reply.stop_reason == "max_tokens":
+            if reply.stop_reason in ("max_tokens", "length"):
                 # A cut-off tool input can still parse as a valid, truncated
                 # object. Never run it: tell the model and let it retry smaller.
                 results = [self.error(c.id, "your output hit max_tokens and this call was cut off; "
@@ -404,26 +640,13 @@ class Agent:
             # All results go back in one message, or the model learns to stop calling tools in parallel.
             self.messages.append({"role": "user", "content": results})
 
-    def request(self, extra: list[dict] | None = None) -> Any:
+    def request(self, extra: list[dict] | None = None) -> Reply:
         """Stream one model response, printing it as it arrives."""
         for attempt in range(3):
             try:
-                with self.client.messages.stream(
-                    model=self.cfg.model,
-                    max_tokens=self.cfg.max_tokens,
-                    system=[{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}],
-                    tools=self.tools,
-                    messages=self.messages + (extra or []),
-                    thinking={"type": "enabled", "budget_tokens": 8_000},
-                ) as stream:
-                    for event in stream:
-                        if event.type == "thinking":
-                            self.ui.stream("thinking", event.thinking)
-                        elif event.type == "text":
-                            self.ui.stream("text", event.text)
-                    reply = stream.get_final_message()
+                reply = self.provider.stream(self.messages, extra)
                 self.ui.end_stream()
-                self.usage.add(reply.usage)
+                self.usage.add(**reply.usage)
                 return reply
             except ValueError:
                 # Tool-input JSON the SDK could not parse at all. The block never
@@ -431,6 +654,79 @@ class Agent:
                 self.ui.line("[malformed tool input from the model; retrying]", UI.RED)
                 if attempt == 2:
                     raise
+
+    # -- tools -------------------------------------------------------------
+
+    def run_tools(self, calls: list[Any]) -> list[dict]:
+        results: dict[str, dict] = {}
+        parallel = []
+        for call in calls:
+            self.ui.line(f"> {summarize_call(call.name, call.input)}", UI.CYAN)
+            spec = self.specs.get(call.name)
+            problem = ("unknown tool" if spec is None else validate_input(spec, call.input))
+            if problem:
+                results[call.id] = self.error(call.id, json.dumps({"INVALID_INPUT": problem, "received": call.input}))
+                continue
+            denied = self.perms.check(call.name, call.input)
+            if denied:
+                results[call.id] = self.error(call.id, denied)
+            elif call.name in READ_ONLY:
+                parallel.append(call)  # safe to run side by side
+            else:
+                results[call.id] = self.execute(call)  # writes run one at a time, in order
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            for call, result in zip(parallel, pool.map(self.execute, parallel)):
+                results[call.id] = result
+        return [results[c.id] for c in calls]
+
+    def execute(self, call: Any) -> dict:
+        args, ws = call.input, self.ws
+        try:
+            match call.name:
+                case "read_file": out = read_file(ws, **args)
+                case "write_file": out = write_file(ws, **args)
+                case "edit_file": out = edit_file(ws, **args)
+                case "bash": out = bash(ws, **args)
+                case "grep": out = grep(ws, **args)
+                case "glob": out = glob_files(ws, **args)
+                case "remember": out = remember(ws, args["note"], self.cfg.memory_file)
+                case "task": out = self.subagent(args["description"], args["prompt"])
+                case _: raise ToolError(f"unknown tool {call.name}")
+        except ToolError as e:
+            self.ui.line(f"  ! {e}", UI.RED)
+            return self.error(call.id, str(e))
+        except Exception as e:  # a bug in a tool should not kill the session
+            return self.error(call.id, f"{type(e).__name__}: {e}")
+        if len(out) > MAX_TOOL_OUTPUT:
+            out = out[:MAX_TOOL_OUTPUT] + f"\n... [cut: {len(out):,} characters total; narrow your request]"
+        return {"type": "tool_result", "tool_use_id": call.id, "content": out}
+
+    @staticmethod
+    def error(tool_use_id: str, message: str) -> dict:
+        return {"type": "tool_result", "tool_use_id": tool_use_id, "content": message, "is_error": True}
+
+    # -- subagents ---------------------------------------------------------
+
+    def subagent(self, description: str, prompt: str) -> str:
+        """A fresh agent with read-only tools. Only its final answer comes back."""
+        child = Agent(
+            provider=copy.copy(self.provider),  # same SDK client, its own transcript
+            cfg=Config(**self.cfg.__dict__),
+            ws=self.ws,
+            perms=self.perms,
+            system=self.system + "\n\nYou are a subagent. Investigate, then reply with a complete, concise report. "
+                                 "Your final message is all the caller sees.",
+            tool_names=SUBAGENT_TOOLS,
+            ui=UI(indent=self.ui.indent + "  | ", quiet=self.ui.quiet, out=self.ui.out),
+        )
+        self.ui.line(f"  [subagent: {description}]", UI.DIM)
+        answer = child.run(prompt)
+        self.usage.input += child.usage.input
+        self.usage.output += child.usage.output
+        self.usage.cache_read += child.usage.cache_read
+        self.usage.cache_write += child.usage.cache_write
+        return answer or "(the subagent returned no answer)"
 
     # -- compaction --------------------------------------------------------
 
@@ -472,78 +768,10 @@ class Agent:
         self.ui.line(f"[compacted to {len(summary):,} characters]", UI.DIM)
         return True
 
-    # -- tools -------------------------------------------------------------
 
-    def run_tools(self, calls: list[Any]) -> list[dict]:
-        results: dict[str, dict] = {}
-        parallel = []
-        for call in calls:
-            self.ui.line(f"> {summarize_call(call.name, call.input)}", UI.CYAN)
-            spec = self.specs.get(call.name)
-            problem = ("unknown tool" if spec is None else validate_input(spec, call.input))
-            if problem:
-                results[call.id] = self.error(call.id, json.dumps({"INVALID_INPUT": problem, "received": call.input}))
-                continue
-            denied = self.perms.check(call.name, call.input)
-            if denied:
-                results[call.id] = self.error(call.id, denied)
-            elif call.name in READ_ONLY:
-                parallel.append(call)  # safe to run side by side
-            else:
-                results[call.id] = self.execute(call)  # writes run one at a time, in order
+# ----------------------------------------------------------------------------
+# System prompt and CLI.
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            for call, result in zip(parallel, pool.map(self.execute, parallel)):
-                results[call.id] = result
-        return [results[c.id] for c in calls]
-
-    def execute(self, call: Any) -> dict:
-        args, ws = call.input, self.ws
-        try:
-            match call.name:
-                case "read_file": out = read_file(ws, **args)
-                case "write_file": out = write_file(ws, **args)
-                case "edit_file": out = edit_file(ws, **args)
-                case "bash": out = bash(ws, **args)
-                case "grep": out = grep(ws, **args)
-                case "glob": out = glob_files(ws, **args)
-                case "task": out = self.subagent(args["description"], args["prompt"])
-                case "remember": out = remember(ws, args["note"], self.cfg.memory_file)
-                case _: raise ToolError(f"unknown tool {call.name}")
-        except ToolError as e:
-            self.ui.line(f"  ! {e}", UI.RED)
-            return self.error(call.id, str(e))
-        except Exception as e:  # a bug in a tool should not kill the session
-            return self.error(call.id, f"{type(e).__name__}: {e}")
-        if len(out) > MAX_TOOL_OUTPUT:
-            out = out[:MAX_TOOL_OUTPUT] + f"\n... [cut: {len(out):,} characters total; narrow your request]"
-        return {"type": "tool_result", "tool_use_id": call.id, "content": out}
-
-    @staticmethod
-    def error(tool_use_id: str, message: str) -> dict:
-        return {"type": "tool_result", "tool_use_id": tool_use_id, "content": message, "is_error": True}
-
-    # -- subagents ---------------------------------------------------------
-
-    def subagent(self, description: str, prompt: str) -> str:
-        """A fresh agent with read-only tools. Only its final answer comes back."""
-        child = Agent(
-            client=self.client,
-            cfg=Config(**self.cfg.__dict__),
-            ws=self.ws,
-            perms=self.perms,
-            system=self.system + "\n\nYou are a subagent. Investigate, then reply with a complete, concise report. "
-                                 "Your final message is all the caller sees.",
-            tool_names=SUBAGENT_TOOLS,
-            ui=UI(indent=self.ui.indent + "  | ", quiet=self.ui.quiet, out=self.ui.out),
-        )
-        self.ui.line(f"  [subagent: {description}]", UI.DIM)
-        answer = child.run(prompt)
-        self.usage.input += child.usage.input
-        self.usage.output += child.usage.output
-        self.usage.cache_read += child.usage.cache_read
-        self.usage.cache_write += child.usage.cache_write
-        return answer or "(the subagent returned no answer)"
 
 def build_system(cfg: Config) -> str:
     memory_path = cfg.root / cfg.memory_file
@@ -561,9 +789,9 @@ How to work:
 - Prefer edit_file for changes to existing files. Run the project's tests or build after changing code.
 - Call independent read-only tools in parallel in a single turn.
 - Use task to delegate broad searches so your own context stays focused.
-- Use remember for durable facts worth knowing next session (commands, conventions, preferences).
 - If an action is refused, do not try to get around the refusal; ask the user.
 - When you finish, say what you changed and how you verified it, plainly. If something failed, say so.
+- Use remember for durable facts worth knowing next session (commands, conventions, preferences).
 """ + (f"\nProject memory ({cfg.memory_file}):\n{memory}\n" if memory else "")
 
 
@@ -598,12 +826,8 @@ def turn(agent: Agent, prompt: str) -> str:
         # Leave the history valid: drop the half-finished turn entirely.
         del agent.messages[before:]
         return ""
-    except anthropic.AuthenticationError:
-        agent.ui.line("[no valid credentials: set ANTHROPIC_API_KEY, or run `ant auth login`]", UI.RED)
-        del agent.messages[before:]
-        return ""
-    except anthropic.APIError as e:  # the SDK already retried 429s, 5xx and dropped connections
-        agent.ui.line(f"[API error: {e}]", UI.RED)
+    except AgentError as e:
+        agent.ui.line(f"[{e}]", UI.RED)
         del agent.messages[before:]
         return ""
     finally:
@@ -614,20 +838,27 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="A complete coding agent in one file.")
     ap.add_argument("prompt", nargs="*", help="run one task and exit (omit for an interactive session)")
     ap.add_argument("--root", default=".", help="project directory (default: current)")
-    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--provider", default="auto", choices=["auto", *PROVIDERS],
+                    help="backend to use (default: infer from the model, or NANO_PROVIDER)")
+    ap.add_argument("--model", default=MODEL, help="model name (default: the provider's default)")
     ap.add_argument("--yolo", action="store_true", help="don't ask before writes and commands")
     ap.add_argument("--compact-at", type=int, default=150_000, help="compact above this many input tokens")
     a = ap.parse_args(argv)
 
-    # The SDK finds credentials in env vars or an `ant auth login` profile; fail early if there are none.
-    if not (any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"))
-            or (Path.home() / ".config" / "anthropic").is_dir()):
-        print("nano-agent: no Anthropic credentials. Set ANTHROPIC_API_KEY, or run `ant auth login`.", file=sys.stderr)
+    cfg = Config(root=Path(a.root).resolve(), model=a.model, provider=a.provider,
+                 yolo=a.yolo, compact_at=a.compact_at)
+
+    # The SDKs find credentials in env vars or their own profile; fail early if there are none.
+    provider = build_provider(cfg)
+    hint = ("ANTHROPIC_API_KEY, or `ant auth login`" if provider.name == "anthropic"
+            else "OPENAI_API_KEY (and OPENAI_BASE_URL for a compatible endpoint)")
+    if not credentials_present(provider.name):
+        print(f"nano-agent: no {provider.name} credentials. Set {hint}.", file=sys.stderr)
         return 1
 
-    cfg = Config(root=Path(a.root).resolve(), model=a.model, yolo=a.yolo, compact_at=a.compact_at)
-    agent = Agent(client=anthropic.Anthropic(), cfg=cfg, ws=Workspace(cfg.root),
+    agent = Agent(provider=provider, cfg=cfg, ws=Workspace(cfg.root),
                   perms=Permissions(cfg.yolo), system=build_system(cfg))
+    agent.ui.line(f"nano-agent ({cfg.provider_label}) in {cfg.root}", UI.DIM)
     if a.prompt:
         turn(agent, " ".join(a.prompt))
     else:
