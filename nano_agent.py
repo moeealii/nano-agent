@@ -38,7 +38,9 @@ from typing import Any, Callable
 # Configuration
 
 MODEL = os.environ.get("NANO_MODEL")  # None means the chosen provider's default
-PRICES = {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25}  # $/MTok, Opus 4.5
+# On a safety-classifier refusal, the API retries on the model it recommends.
+BETAS = ["server-side-fallback-2026-07-01"]
+PRICES = {"input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 5.00}  # $/MTok, Opus 5.5
 MAX_TOOL_OUTPUT = 30_000  # characters of tool output the model gets back
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".mypy_cache"}
 
@@ -48,6 +50,7 @@ class Config:
     root: Path
     model: str | None = MODEL
     provider: str = "auto"  # anthropic | openai | auto (from NANO_PROVIDER or the model name)
+    effort: str = "high"
     max_tokens: int = 64_000
     compact_at: int = 150_000  # input tokens; compaction runs above this
     yolo: bool = False  # skip permission prompts (catastrophic commands stay blocked)
@@ -399,7 +402,7 @@ class Provider:
 
 class AnthropicProvider(Provider):
     name = "anthropic"
-    default_model = "claude-opus-4-5"
+    default_model = "claude-opus-5-5"
     prices = PRICES
 
     def stream(self, messages: list[dict], extra: list[dict] | None = None) -> Reply:
@@ -411,7 +414,11 @@ class AnthropicProvider(Provider):
             system=[{"type": "text", "text": agent.system, "cache_control": {"type": "ephemeral"}}],
             tools=agent.tools,
             messages=messages + (extra or []),
-            thinking={"type": "enabled", "budget_tokens": 8_000},
+            thinking={"type": "adaptive", "display": "summarized"},
+            output_config={"effort": cfg.effort},
+            cache_control={"type": "ephemeral"},  # also cache the growing conversation
+            betas=BETAS,
+            fallbacks="default",
         ) as stream:
             for event in stream:
                 if event.type == "thinking":
@@ -436,7 +443,7 @@ class OpenAIProvider(Provider):
     """Any OpenAI-compatible /chat/completions endpoint: OpenAI, OpenRouter, vLLM, Ollama."""
 
     name = "openai"
-    default_model = "gpt-4.1"
+    default_model = "gpt-5.2"
     # OpenAI-compatible endpoints rarely bill at these prices; treat them as an estimate.
     prices = {"input": 2.00, "output": 8.00, "cache_read": 0.50, "cache_write": 2.00}
 
@@ -488,10 +495,13 @@ class OpenAIProvider(Provider):
                                       messages=self._messages(agent.system, messages + (extra or [])),
                                       max_tokens=cfg.max_tokens, tools=self._tools(agent.tools), stream=True,
                                       stream_options={"include_usage": True})
+        if cfg.effort in ("low", "medium", "high"):
+            kwargs["reasoning_effort"] = cfg.effort
         try:
             stream = self.client.chat.completions.create(**kwargs)
-        except TypeError:  # a compatible server that doesn't know stream_options
+        except TypeError:  # a compatible server that doesn't know stream_options/reasoning_effort
             kwargs.pop("stream_options", None)
+            kwargs.pop("reasoning_effort", None)
             stream = self.client.chat.completions.create(**kwargs)
 
         text: list[str] = []
@@ -712,7 +722,7 @@ class Agent:
         """A fresh agent with read-only tools. Only its final answer comes back."""
         child = Agent(
             provider=copy.copy(self.provider),  # same SDK client, its own transcript
-            cfg=Config(**self.cfg.__dict__),
+            cfg=Config(**{**self.cfg.__dict__, "effort": "medium"}),
             ws=self.ws,
             perms=self.perms,
             system=self.system + "\n\nYou are a subagent. Investigate, then reply with a complete, concise report. "
@@ -796,7 +806,7 @@ How to work:
 
 
 def repl(agent: Agent) -> None:
-    print(f"nano-agent ({agent.cfg.model}) in {agent.cfg.root}")
+    print(f"nano-agent ({agent.cfg.model}, effort {agent.cfg.effort}) in {agent.cfg.root}")
     print("Commands: /cost  /compact  /exit\n")
     while True:
         try:
@@ -841,11 +851,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--provider", default="auto", choices=["auto", *PROVIDERS],
                     help="backend to use (default: infer from the model, or NANO_PROVIDER)")
     ap.add_argument("--model", default=MODEL, help="model name (default: the provider's default)")
+    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
     ap.add_argument("--yolo", action="store_true", help="don't ask before writes and commands")
     ap.add_argument("--compact-at", type=int, default=150_000, help="compact above this many input tokens")
     a = ap.parse_args(argv)
 
-    cfg = Config(root=Path(a.root).resolve(), model=a.model, provider=a.provider,
+    cfg = Config(root=Path(a.root).resolve(), model=a.model, provider=a.provider, effort=a.effort,
                  yolo=a.yolo, compact_at=a.compact_at)
 
     # The SDKs find credentials in env vars or their own profile; fail early if there are none.
@@ -858,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
 
     agent = Agent(provider=provider, cfg=cfg, ws=Workspace(cfg.root),
                   perms=Permissions(cfg.yolo), system=build_system(cfg))
-    agent.ui.line(f"nano-agent ({cfg.provider_label}) in {cfg.root}", UI.DIM)
+    agent.ui.line(f"nano-agent ({cfg.provider_label}, effort {cfg.effort}) in {cfg.root}", UI.DIM)
     if a.prompt:
         turn(agent, " ".join(a.prompt))
     else:

@@ -52,8 +52,7 @@ class FakeClient:
     def __init__(self, *replies):
         self.replies = list(replies)
         self.requests = []
-        self.messages = NS(stream=self.stream)
-        self.beta = NS(messages=self.messages)
+        self.beta = NS(messages=NS(stream=self.stream))
 
     def stream(self, **kwargs):
         # Deep-copy what was sent: the agent keeps mutating its history afterwards.
@@ -85,8 +84,10 @@ def test_plain_answer_and_request_shape(project):
     agent = make_agent(project, client)
     assert agent.run("hi") == "hello"
     req = client.requests[0]
-    assert req["model"] == "claude-opus-4-5"
-    assert req["thinking"] == {"type": "enabled", "budget_tokens": 8_000}
+    assert req["model"] == "claude-opus-5-5"
+    assert req["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert req["output_config"] == {"effort": "high"}
+    assert req["fallbacks"] == "default" and req["betas"] == ["server-side-fallback-2026-07-01"]
     assert req["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert all(t["eager_input_streaming"] for t in req["tools"])
 

@@ -29,28 +29,30 @@ These are the decisions worth stealing.
 
 **The prompt prefix never changes mid-session.** The system prompt and tool list are fixed when the agent starts, and both are marked for prompt caching. A long session re-reads them every turn at cache prices. That's also why `remember` writes to `NANO.md` for the *next* session instead of editing the current system prompt: editing it would throw away the cache, and on current Claude models it would also invalidate every thinking block already in the history.
 
-**Tool inputs stream, so they are validated by hand.** Tools set `eager_input_streaming`, so a 400-line `write_file` starts arriving immediately instead of after a long silence. The cost is that the API no longer validates those inputs. `validate_input()` checks every call against its schema before it runs. A call cut off by `max_tokens` is never executed, even when the truncated JSON happens to parse. Bad inputs go back to the model as errors it can fix.
-
 **The agent owns its transcript, not the wire format.** Tool calls, results and thinking are kept in one normalized shape. Each provider adapter translates that to the vendor's streaming API on the way out - the Anthropic adapter sends `tool_use`/`tool_result` blocks, the OpenAI one sends `tool_calls` and `role: "tool"` messages - and normalizes `finish_reason` back, so `max_tokens` and `length` mean the same thing to the loop. Adding a backend is one adapter, not a change to the loop.
 
 **Compaction is "simple compaction".** When the last request was over `--compact-at` tokens (150k by default), the agent asks the model for a structured summary. It then replaces the entire history with that one message, replaying no old turns and no old thinking blocks. Keeping the last few turns verbatim looks smarter but breaks: those turns' thinking was produced alongside history that no longer exists. Compaction only runs between tool rounds, never while a tool call is waiting for its result. A brand-new user request is kept word for word after the summary, not summarised away.
+
+**Tool inputs stream, so they're validated by hand.** Tools set `eager_input_streaming`, so a 400-line `write_file` starts arriving immediately instead of after a long silence. The cost is that the API no longer validates those inputs. `validate_input()` checks every call against its schema before it runs. A call cut off by `max_tokens` is never executed, even when the truncated JSON happens to parse. Bad inputs go back to the model as errors it can fix.
 
 **Parallel where it's safe.** The model can request several tools at once. Read-only ones run in a thread pool. Writes and commands run one at a time, in order, after their permission prompt. All results go back in a single message: splitting them teaches the model to stop calling tools in parallel.
 
 **Failure is information.** Tool errors, refused permissions, invalid input and stale-file edits all come back as `is_error` tool results with a reason the model can act on. Nothing in a tool can crash the session, and Ctrl-C drops the half-finished turn so the history stays valid.
 
+**Refusals fall back.** Requests opt into server-side fallback (`fallbacks="default"`). If a safety classifier declines, the API retries on the model it recommends for that category instead of just stopping.
+
 ## Options
 
 ```
 python nano_agent.py [prompt ...] [--root DIR] [--provider auto|anthropic|openai] [--model MODEL]
-                     [--yolo] [--compact-at TOKENS]
+                     [--effort low|medium|high|xhigh|max] [--yolo] [--compact-at TOKENS]
 ```
-
-In an interactive session, `/cost` shows tokens and dollars so far, `/compact` compacts now, and `/exit` quits.
 
 `--provider auto` (the default) reads `NANO_PROVIDER`, then guesses from the model name: `claude-*` goes to Anthropic, `gpt-*` to the OpenAI-compatible client. `NANO_MODEL` sets the default model. For a self-hosted endpoint, set `OPENAI_BASE_URL` (and `OPENAI_API_KEY` to anything it accepts).
 
-The default model is `claude-opus-4-5` on Anthropic and `gpt-4.1` on the OpenAI-compatible client; `--model` overrides either.
+In an interactive session, `/cost` shows tokens and dollars so far, `/compact` compacts now, and `/exit` quits.
+
+The default model is `claude-opus-5-5` on Anthropic and `gpt-5.2` on the OpenAI-compatible client; `--model` overrides either. Subagents run at `medium` effort.
 
 ## Tests
 
@@ -59,6 +61,6 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-The tests drive the real loop against a scripted fake client, so they run offline in about 2 seconds. They check both provider adapters (transcript translation, streamed tool-call fragments, error labelling, finish-reason mapping), the request shape, the read, edit and fix flow, permissions (decline, always, the never-run list), path escapes, tool errors, and the interactive output.
+The tests drive the real loop against a scripted fake client, so they run offline in about 2 seconds. They check the request shape, the read, edit and fix flow, permissions (decline, always, the never-run list), path escapes, stale and ambiguous edits, invalid and truncated tool input, refusals, parallel result ordering, malformed-JSON retries, compaction (prefix unchanged, nothing replayed, new prompt kept, never mid-round), subagents (read-only tools, fresh context, usage rolled up), memory, and both provider adapters (transcript translation, streamed tool-call fragments, error labelling, finish-reason mapping).
 
 MIT licensed.
