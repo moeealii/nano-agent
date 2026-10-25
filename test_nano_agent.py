@@ -2,6 +2,7 @@
 
 import copy
 import io
+import pathlib
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -379,3 +380,51 @@ def test_provider_defaults_fill_in_a_model(project):
     assert cfg.model == na.OpenAIProvider.default_model and provider.name == "openai"
     with pytest.raises(na.AgentError, match="unknown provider"):
         na.build_provider(na.Config(root=project, provider="nope"))
+
+
+def test_gpt_61_sol_uses_max_completion_tokens_and_effort(project):
+    client = FakeOpenAI([chunk(oa_choice(content="hi"), usage=NS(prompt_tokens=10, completion_tokens=2))])
+    agent = make_openai_agent(project, client, model="gpt-6.1-sol", effort="xhigh")
+    assert agent.run("hi") == "hi"
+    sent = client.requests[0]
+    assert sent["model"] == "gpt-6.1-sol"
+    assert sent["max_completion_tokens"] == 64_000
+    assert "max_tokens" not in sent
+    assert sent["reasoning_effort"] == "xhigh"
+
+
+def test_classic_models_keep_max_tokens(project):
+    client = FakeOpenAI([chunk(oa_choice(content="hi"), usage=NS(prompt_tokens=10, completion_tokens=2))])
+    make_openai_agent(project, client, model="gpt-4.1", effort="high").run("hi")
+    sent = client.requests[0]
+    assert sent["max_tokens"] == 64_000
+    assert "max_completion_tokens" not in sent
+    assert "reasoning_effort" not in sent
+
+
+def test_compatible_server_without_max_completion_tokens_is_retried_once(project):
+    class OldServer(FakeOpenAI):
+        def create(self, **kwargs):
+            if "max_completion_tokens" in kwargs:
+                raise ValueError("Unsupported parameter: 'max_completion_tokens' is not supported with this model.")
+            return super().create(**kwargs)
+
+    client = OldServer([chunk(oa_choice(content="hi"), usage=NS(prompt_tokens=10, completion_tokens=2))])
+    make_openai_agent(project, client, model="gpt-6.1-sol").run("hi")
+    assert "max_tokens" in client.requests[0]
+
+
+def test_other_api_errors_are_not_swallowed(project):
+    class Broken(FakeOpenAI):
+        def create(self, **kwargs):
+            raise ValueError("context length exceeded")
+
+    with pytest.raises(ValueError, match="context length"):
+        make_openai_agent(project, Broken(), model="gpt-6.1-sol").run("hi")
+
+
+def test_gpt_61_sol_is_inferred_as_openai(monkeypatch):
+    monkeypatch.delenv("NANO_PROVIDER", raising=False)
+    assert na.provider_for("auto", "gpt-6.1-sol") == "openai"
+    cfg = na.Config(root=pathlib.Path("."), provider="auto", model="gpt-6.1-sol")
+    assert na.build_provider(cfg, client=object()).name == "openai"

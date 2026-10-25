@@ -41,6 +41,7 @@ MODEL = os.environ.get("NANO_MODEL")  # None means the chosen provider's default
 # On a safety-classifier refusal, the API retries on the model it recommends.
 BETAS = ["server-side-fallback-2026-07-01"]
 PRICES = {"input": 4.00, "output": 20.00, "cache_read": 0.20, "cache_write": 5.00}  # $/MTok, Opus 5.5
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MAX_TOOL_OUTPUT = 30_000  # characters of tool output the model gets back
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".mypy_cache"}
 
@@ -436,16 +437,33 @@ class AnthropicProvider(Provider):
         )
 
 
-TOOL_RESULT_HEADER = "tool result"
+# Models that reject max_tokens and take max_completion_tokens instead.
+REASONING_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
 
 
 class OpenAIProvider(Provider):
     """Any OpenAI-compatible /chat/completions endpoint: OpenAI, OpenRouter, vLLM, Ollama."""
 
     name = "openai"
-    default_model = "gpt-5.2"
+    default_model = "gpt-6.1-sol"
     # OpenAI-compatible endpoints rarely bill at these prices; treat them as an estimate.
     prices = {"input": 2.00, "output": 8.00, "cache_read": 0.50, "cache_write": 2.00}
+
+    @staticmethod
+    def reasoning_model(model: str | None) -> bool:
+        return (model or "").lower().startswith(REASONING_PREFIXES)
+
+    @classmethod
+    def _payload(cls, base: dict, cfg: "Config", completion_tokens: bool) -> dict:
+        """Reasoning models take max_completion_tokens and an effort level; older ones take max_tokens."""
+        payload = dict(base)
+        if completion_tokens:
+            payload["max_completion_tokens"] = cfg.max_tokens
+            if cfg.effort in EFFORTS:
+                payload["reasoning_effort"] = cfg.effort
+        else:
+            payload["max_tokens"] = cfg.max_tokens
+        return payload
 
     @staticmethod
     def _tools(specs: list[dict]) -> list[dict]:
@@ -491,18 +509,22 @@ class OpenAIProvider(Provider):
     def stream(self, messages: list[dict], extra: list[dict] | None = None) -> Reply:
         agent = self.agent
         cfg, ui = agent.cfg, agent.ui
-        kwargs: dict[str, Any] = dict(model=cfg.model,
-                                      messages=self._messages(agent.system, messages + (extra or [])),
-                                      max_tokens=cfg.max_tokens, tools=self._tools(agent.tools), stream=True,
-                                      stream_options={"include_usage": True})
-        if cfg.effort in ("low", "medium", "high"):
-            kwargs["reasoning_effort"] = cfg.effort
+        base: dict[str, Any] = dict(model=cfg.model,
+                                    messages=self._messages(agent.system, messages + (extra or [])),
+                                    tools=self._tools(agent.tools), stream=True,
+                                    stream_options={"include_usage": True})
+        reasoning = self.reasoning_model(cfg.model)
         try:
-            stream = self.client.chat.completions.create(**kwargs)
-        except TypeError:  # a compatible server that doesn't know stream_options/reasoning_effort
-            kwargs.pop("stream_options", None)
-            kwargs.pop("reasoning_effort", None)
-            stream = self.client.chat.completions.create(**kwargs)
+            stream = self.client.chat.completions.create(**self._payload(base, cfg, completion_tokens=reasoning))
+        except TypeError:
+            # The SDK itself does not know one of the arguments: drop the extras and retry.
+            stream = self.client.chat.completions.create(**self._payload(base, cfg, completion_tokens=False))
+        except Exception as e:
+            # A compatible server that predates max_completion_tokens. Only retry when the
+            # server actually names the parameter; anything else is a real failure.
+            if not (reasoning and "max_completion_tokens" in str(e)):
+                raise
+            stream = self.client.chat.completions.create(**self._payload(base, cfg, completion_tokens=False))
 
         text: list[str] = []
         calls: dict[int, dict] = {}
@@ -851,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--provider", default="auto", choices=["auto", *PROVIDERS],
                     help="backend to use (default: infer from the model, or NANO_PROVIDER)")
     ap.add_argument("--model", default=MODEL, help="model name (default: the provider's default)")
-    ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
+    ap.add_argument("--effort", default="high", choices=EFFORTS)
     ap.add_argument("--yolo", action="store_true", help="don't ask before writes and commands")
     ap.add_argument("--compact-at", type=int, default=150_000, help="compact above this many input tokens")
     a = ap.parse_args(argv)

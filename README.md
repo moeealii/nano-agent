@@ -52,7 +52,9 @@ python nano_agent.py [prompt ...] [--root DIR] [--provider auto|anthropic|openai
 
 In an interactive session, `/cost` shows tokens and dollars so far, `/compact` compacts now, and `/exit` quits.
 
-The default model is `claude-opus-5-5` on Anthropic and `gpt-5.2` on the OpenAI-compatible client; `--model` overrides either. Subagents run at `medium` effort.
+The default model is `claude-opus-5-5` on Anthropic and `gpt-6.1-sol` on the OpenAI-compatible client; `--model` overrides either. Subagents run at `medium` effort.
+
+Reasoning models (`gpt-5*`, `gpt-6*`, `o1`, `o3`, `o4`) are detected by name: they get `max_completion_tokens` instead of `max_tokens` and pass `--effort` through as `reasoning_effort`. Older models keep `max_tokens`. If a compatible endpoint rejects `max_completion_tokens`, the request is retried once with `max_tokens`; any other error is raised normally.
 
 ## Tests
 
